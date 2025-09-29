@@ -58,6 +58,10 @@ rules:
     excludes:
       # for example, exclude ubuntu from harbor's proxy cache
       - '^docker.io/(library/)?ubuntu:.*$'
+    namespaceMatches:
+      # only apply to kube-system namespace
+      - "^kube-system$"
+    namespaceExcludes: []
     replace: 'harbor.example.com/dockerhub-proxy'
     checkUpstream: false
   - name: 'docker.io ubuntu rewrite rule'
