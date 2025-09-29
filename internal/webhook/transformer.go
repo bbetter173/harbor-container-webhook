@@ -76,6 +76,9 @@ type ContainerTransformer interface {
 	// CheckUpstream ensures that the docker image reference exists in the upstream registry
 	// and returns if the image exists, or an error if the registry can't be contacted.
 	CheckUpstream(ctx context.Context, imageRef string) (bool, error)
+
+	// GetImagePullSecrets returns the image pull secrets that should be injected when this rule is applied
+	GetImagePullSecrets() []config.ImagePullSecret
 }
 
 func MakeTransformers(rules []config.ProxyRule, client client.Client) ([]ContainerTransformer, error) {
@@ -317,4 +320,9 @@ func (t *ruleTransformer) ShouldApplyToNamespace(namespace string) bool {
 	}
 
 	return true
+}
+
+// GetImagePullSecrets returns the image pull secrets that should be injected when this rule is applied
+func (t *ruleTransformer) GetImagePullSecrets() []config.ImagePullSecret {
+	return t.rule.ImagePullSecrets
 }

@@ -7,6 +7,7 @@ import (
 	"github.com/indeedeng-alpha/harbor-container-webhook/internal/config"
 
 	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
 )
 
 func TestPodContainerProxier_rewriteImage(t *testing.T) {
@@ -93,9 +94,244 @@ func TestPodContainerProxier_rewriteImage(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			rewritten, err := proxier.rewriteImage(context.TODO(), tc.image)
+			rewritten, imagePullSecrets, err := proxier.rewriteImage(context.TODO(), tc.image)
 			require.NoError(t, err)
 			require.Equal(t, tc.expected, rewritten)
+			// Image pull secrets should be empty for these test cases since the rules don't define any
+			require.Empty(t, imagePullSecrets)
+		})
+	}
+}
+
+func TestPodContainerProxier_rewriteImageWithSecrets(t *testing.T) {
+	transformers, err := MakeTransformers([]config.ProxyRule{
+		{
+			Name:    "docker.io proxy with secrets",
+			Matches: []string{"^docker.io"},
+			Replace: "harbor.example.com/dockerhub-proxy",
+			ImagePullSecrets: []config.ImagePullSecret{
+				{Name: "harbor-secret"},
+				{Name: "backup-secret"},
+			},
+		},
+		{
+			Name:    "quay.io proxy without secrets",
+			Matches: []string{"^quay.io"},
+			Replace: "harbor.example.com/quay-proxy",
+		},
+	}, nil)
+	require.NoError(t, err)
+	proxier := PodContainerProxier{
+		Transformers: transformers,
+	}
+
+	tests := []struct {
+		name                string
+		image               string
+		expectedImage       string
+		expectedSecretNames []string
+		shouldRewrite       bool
+	}{
+		{
+			name:                "docker.io image should be rewritten with secrets",
+			image:               "docker.io/library/nginx:latest",
+			expectedImage:       "harbor.example.com/dockerhub-proxy/library/nginx:latest",
+			expectedSecretNames: []string{"harbor-secret", "backup-secret"},
+			shouldRewrite:       true,
+		},
+		{
+			name:                "quay.io image should be rewritten without secrets",
+			image:               "quay.io/bitnami/nginx:latest",
+			expectedImage:       "harbor.example.com/quay-proxy/bitnami/nginx:latest",
+			expectedSecretNames: []string{},
+			shouldRewrite:       true,
+		},
+		{
+			name:                "gcr.io image should not be rewritten",
+			image:               "gcr.io/project/image:latest",
+			expectedImage:       "gcr.io/project/image:latest",
+			expectedSecretNames: []string{},
+			shouldRewrite:       false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rewritten, imagePullSecrets, err := proxier.rewriteImage(context.TODO(), tc.image)
+			require.NoError(t, err)
+			require.Equal(t, tc.expectedImage, rewritten)
+
+			if tc.shouldRewrite {
+				require.Len(t, imagePullSecrets, len(tc.expectedSecretNames))
+				actualNames := make([]string, len(imagePullSecrets))
+				for i, secret := range imagePullSecrets {
+					actualNames[i] = secret.Name
+				}
+				require.ElementsMatch(t, tc.expectedSecretNames, actualNames)
+			} else {
+				require.Empty(t, imagePullSecrets)
+			}
+		})
+	}
+}
+
+func TestPodContainerProxier_mergeImagePullSecrets(t *testing.T) {
+	proxier := PodContainerProxier{}
+
+	tests := []struct {
+		name     string
+		existing []corev1.LocalObjectReference
+		toAdd    []corev1.LocalObjectReference
+		expected []string
+	}{
+		{
+			name:     "merge with empty existing",
+			existing: []corev1.LocalObjectReference{},
+			toAdd: []corev1.LocalObjectReference{
+				{Name: "secret1"},
+				{Name: "secret2"},
+			},
+			expected: []string{"secret1", "secret2"},
+		},
+		{
+			name: "merge with existing secrets",
+			existing: []corev1.LocalObjectReference{
+				{Name: "existing-secret"},
+			},
+			toAdd: []corev1.LocalObjectReference{
+				{Name: "new-secret1"},
+				{Name: "new-secret2"},
+			},
+			expected: []string{"existing-secret", "new-secret1", "new-secret2"},
+		},
+		{
+			name: "deduplication - avoid adding duplicates",
+			existing: []corev1.LocalObjectReference{
+				{Name: "secret1"},
+				{Name: "secret2"},
+			},
+			toAdd: []corev1.LocalObjectReference{
+				{Name: "secret2"}, // duplicate
+				{Name: "secret3"}, // new
+			},
+			expected: []string{"secret1", "secret2", "secret3"},
+		},
+		{
+			name:     "add to empty list",
+			existing: []corev1.LocalObjectReference{},
+			toAdd:    []corev1.LocalObjectReference{},
+			expected: []string{},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			result := proxier.mergeImagePullSecrets(tc.existing, tc.toAdd)
+
+			actualNames := make([]string, len(result))
+			for i, secret := range result {
+				actualNames[i] = secret.Name
+			}
+
+			require.ElementsMatch(t, tc.expected, actualNames)
+		})
+	}
+}
+
+func TestPodContainerProxier_updateContainersWithSecrets(t *testing.T) {
+	transformers, err := MakeTransformers([]config.ProxyRule{
+		{
+			Name:    "docker.io proxy with secrets",
+			Matches: []string{"^docker.io"},
+			Replace: "harbor.example.com/dockerhub-proxy",
+			ImagePullSecrets: []config.ImagePullSecret{
+				{Name: "harbor-secret"},
+			},
+		},
+	}, nil)
+	require.NoError(t, err)
+	proxier := PodContainerProxier{
+		Transformers: transformers,
+	}
+
+	tests := []struct {
+		name                  string
+		containers            []corev1.Container
+		expectedUpdated       bool
+		expectedSecretNames   []string
+		expectedImageRewrites map[string]string // original -> expected
+	}{
+		{
+			name: "single container with rewrite",
+			containers: []corev1.Container{
+				{Name: "app", Image: "docker.io/library/nginx:latest"},
+			},
+			expectedUpdated:     true,
+			expectedSecretNames: []string{"harbor-secret"},
+			expectedImageRewrites: map[string]string{
+				"docker.io/library/nginx:latest": "harbor.example.com/dockerhub-proxy/library/nginx:latest",
+			},
+		},
+		{
+			name: "multiple containers with same rule",
+			containers: []corev1.Container{
+				{Name: "app1", Image: "docker.io/library/nginx:latest"},
+				{Name: "app2", Image: "docker.io/library/alpine:latest"},
+			},
+			expectedUpdated:     true,
+			expectedSecretNames: []string{"harbor-secret"}, // should be deduplicated
+			expectedImageRewrites: map[string]string{
+				"docker.io/library/nginx:latest":  "harbor.example.com/dockerhub-proxy/library/nginx:latest",
+				"docker.io/library/alpine:latest": "harbor.example.com/dockerhub-proxy/library/alpine:latest",
+			},
+		},
+		{
+			name: "mixed containers - some rewrite, some don't",
+			containers: []corev1.Container{
+				{Name: "app1", Image: "docker.io/library/nginx:latest"},
+				{Name: "app2", Image: "gcr.io/project/image:latest"},
+			},
+			expectedUpdated:     true,
+			expectedSecretNames: []string{"harbor-secret"},
+			expectedImageRewrites: map[string]string{
+				"docker.io/library/nginx:latest": "harbor.example.com/dockerhub-proxy/library/nginx:latest",
+				"gcr.io/project/image:latest":    "gcr.io/project/image:latest", // unchanged
+			},
+		},
+		{
+			name: "no containers match",
+			containers: []corev1.Container{
+				{Name: "app", Image: "gcr.io/project/image:latest"},
+			},
+			expectedUpdated:     false,
+			expectedSecretNames: []string{},
+			expectedImageRewrites: map[string]string{
+				"gcr.io/project/image:latest": "gcr.io/project/image:latest",
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			updatedContainers, updated, secrets, err := proxier.updateContainers(context.TODO(), tc.containers, "normal")
+			require.NoError(t, err)
+			require.Equal(t, tc.expectedUpdated, updated)
+
+			// Check collected secrets
+			actualSecretNames := make([]string, len(secrets))
+			for i, secret := range secrets {
+				actualSecretNames[i] = secret.Name
+			}
+			require.ElementsMatch(t, tc.expectedSecretNames, actualSecretNames)
+
+			// Check container image rewrites
+			require.Len(t, updatedContainers, len(tc.containers))
+			for i, container := range updatedContainers {
+				originalImage := tc.containers[i].Image
+				expectedImage, exists := tc.expectedImageRewrites[originalImage]
+				require.True(t, exists, "Expected image rewrite mapping for %s", originalImage)
+				require.Equal(t, expectedImage, container.Image)
+			}
 		})
 	}
 }

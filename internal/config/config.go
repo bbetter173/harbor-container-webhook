@@ -63,6 +63,10 @@ type Configuration struct {
 	Verbose bool `yaml:"verbose"`
 }
 
+type ImagePullSecret struct {
+	Name string `yaml:"name"`
+}
+
 // ProxyRule contains a list of regex rules used to match against images. Image references that match and are not
 // excluded have their registry rewritten with the replacement string.
 type ProxyRule struct {
@@ -90,4 +94,7 @@ type ProxyRule struct {
 	NamespaceMatches []string `yaml:"namespaceMatches"`
 	// NamespaceExcludes is a list of regular expressions that match a namespace a rule should not be applied to
 	NamespaceExcludes []string `yaml:"namespaceExcludes"`
+	// ImagePullSecrets is an optional list of image pull secrets that should be injected into the pod definition when a rule
+	// is applied.
+	ImagePullSecrets []ImagePullSecret `yaml:"imagePullSecrets"`
 }
