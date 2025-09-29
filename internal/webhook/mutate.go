@@ -38,11 +38,27 @@ func (p *PodContainerProxier) Handle(ctx context.Context, req admission.Request)
 		return admission.Errored(http.StatusBadRequest, err)
 	}
 
+	// Filter transformers based on the pod's namespace
+	namespace := req.Namespace
+	applicableTransformers := p.filterTransformersByNamespace(namespace)
+	if len(applicableTransformers) == 0 {
+		return admission.Allowed("no applicable rules for namespace")
+	}
+
+	// Temporarily replace transformers with filtered ones for this request
+	originalTransformers := p.Transformers
+	p.Transformers = applicableTransformers
+
 	initContainers, updatedInit, err := p.updateContainers(ctx, pod.Spec.InitContainers, "init")
 	if err != nil {
+		p.Transformers = originalTransformers // restore original transformers
 		return admission.Errored(http.StatusInternalServerError, err)
 	}
 	containers, updated, err := p.updateContainers(ctx, pod.Spec.Containers, "normal")
+
+	// Restore original transformers
+	p.Transformers = originalTransformers
+
 	if err != nil {
 		return admission.Errored(http.StatusInternalServerError, err)
 	}
@@ -112,6 +128,25 @@ func (p *PodContainerProxier) rewriteImage(ctx context.Context, imageRef string)
 
 // PodContainerProxier implements admission.DecoderInjector.
 // A decoder will be automatically injected.
+
+// filterTransformersByNamespace returns only the transformers that should apply to the given namespace
+func (p *PodContainerProxier) filterTransformersByNamespace(namespace string) []ContainerTransformer {
+	applicableTransformers := make([]ContainerTransformer, 0)
+
+	for _, transformer := range p.Transformers {
+		// Type assert to access the ShouldApplyToNamespace method
+		if ruleTransformer, ok := transformer.(*ruleTransformer); ok {
+			if ruleTransformer.ShouldApplyToNamespace(namespace) {
+				applicableTransformers = append(applicableTransformers, transformer)
+			}
+		} else {
+			// For any other transformer types, include them (backward compatibility)
+			applicableTransformers = append(applicableTransformers, transformer)
+		}
+	}
+
+	return applicableTransformers
+}
 
 // InjectDecoder injects the decoder.
 func (p *PodContainerProxier) InjectDecoder(d admission.Decoder) error {

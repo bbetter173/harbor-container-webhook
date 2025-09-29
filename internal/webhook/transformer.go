@@ -97,18 +97,22 @@ type ruleTransformer struct {
 
 	client client.Client
 
-	matches  []*regexp.Regexp
-	excludes []*regexp.Regexp
+	matches           []*regexp.Regexp
+	excludes          []*regexp.Regexp
+	namespaceMatches  []*regexp.Regexp
+	namespaceExcludes []*regexp.Regexp
 }
 
 var _ ContainerTransformer = (*ruleTransformer)(nil)
 
 func newRuleTransformer(rule config.ProxyRule) (*ruleTransformer, error) {
 	transformer := &ruleTransformer{
-		rule:       rule,
-		metricName: invalidMetricChars.ReplaceAllString(strings.ToLower(rule.Name), "_"),
-		matches:    make([]*regexp.Regexp, 0, len(rule.Matches)),
-		excludes:   make([]*regexp.Regexp, 0, len(rule.Excludes)),
+		rule:              rule,
+		metricName:        invalidMetricChars.ReplaceAllString(strings.ToLower(rule.Name), "_"),
+		matches:           make([]*regexp.Regexp, 0, len(rule.Matches)),
+		excludes:          make([]*regexp.Regexp, 0, len(rule.Excludes)),
+		namespaceMatches:  make([]*regexp.Regexp, 0, len(rule.NamespaceMatches)),
+		namespaceExcludes: make([]*regexp.Regexp, 0, len(rule.NamespaceExcludes)),
 	}
 	for _, matchRegex := range rule.Matches {
 		matcher, err := regexp.Compile(matchRegex)
@@ -123,6 +127,20 @@ func newRuleTransformer(rule config.ProxyRule) (*ruleTransformer, error) {
 			return nil, fmt.Errorf("failed to compile exclude regex %q: %w", excludeRegex, err)
 		}
 		transformer.excludes = append(transformer.excludes, excluder)
+	}
+	for _, namespaceMatchRegex := range rule.NamespaceMatches {
+		namespaceMatcher, err := regexp.Compile(namespaceMatchRegex)
+		if err != nil {
+			return nil, fmt.Errorf("failed to compile namespace match regex %q: %w", namespaceMatchRegex, err)
+		}
+		transformer.namespaceMatches = append(transformer.namespaceMatches, namespaceMatcher)
+	}
+	for _, namespaceExcludeRegex := range rule.NamespaceExcludes {
+		namespaceExcluder, err := regexp.Compile(namespaceExcludeRegex)
+		if err != nil {
+			return nil, fmt.Errorf("failed to compile namespace exclude regex %q: %w", namespaceExcludeRegex, err)
+		}
+		transformer.namespaceExcludes = append(transformer.namespaceExcludes, namespaceExcluder)
 	}
 
 	return transformer, nil
@@ -271,4 +289,32 @@ func (t *ruleTransformer) anyExclusion(imageRef string) bool {
 		}
 	}
 	return false
+}
+
+// ShouldApplyToNamespace determines if this rule should be applied to the given namespace
+func (t *ruleTransformer) ShouldApplyToNamespace(namespace string) bool {
+	// If NamespaceMatches is specified, the namespace must match at least one pattern
+	if len(t.namespaceMatches) > 0 {
+		matched := false
+		for _, rule := range t.namespaceMatches {
+			if rule.MatchString(namespace) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return false
+		}
+	}
+
+	// If NamespaceExcludes is specified, the namespace must not match any exclude pattern
+	if len(t.namespaceExcludes) > 0 {
+		for _, rule := range t.namespaceExcludes {
+			if rule.MatchString(namespace) {
+				return false
+			}
+		}
+	}
+
+	return true
 }

@@ -86,4 +86,8 @@ type ProxyRule struct {
 	AuthSecretName string `yaml:"authSecretName"`
 	// Namespace that the webhook is running in, used for accessing secrets for authenticated proxy rules
 	Namespace string
+	// NamespaceMatches is a list of regular expressions that match a namespace a rule should be applied to
+	NamespaceMatches []string `yaml:"namespaceMatches"`
+	// NamespaceExcludes is a list of regular expressions that match a namespace a rule should not be applied to
+	NamespaceExcludes []string `yaml:"namespaceExcludes"`
 }
