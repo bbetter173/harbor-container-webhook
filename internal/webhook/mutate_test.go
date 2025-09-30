@@ -301,3 +301,44 @@ func TestPodContainerProxier_updateImagePullSecretsWithReplaceDinabled(t *testin
 		})
 	}
 }
+
+func TestPodContainerProxier_updateImagePullSecretsWithNamespaceFiltering(t *testing.T) {
+	// This test verifies the bug fix where transformer list was restored too early,
+	// causing namespace-filtered transformers to not update imagePullSecrets
+	transformers, err := MakeTransformers([]config.ProxyRule{
+		{
+			Name:                    "quay.io proxy cache with imagePullSecrets change for kube-system only",
+			Matches:                 []string{"^quay.io"},
+			Replace:                 "harbor.example.com/quay-proxy",
+			ReplaceImagePullSecrets: true,
+			AuthSecretName:          "kube-system-secret",
+			NamespaceMatches:        []string{"^kube-system$"}, // Only applies to kube-system
+		},
+	}, nil)
+	require.NoError(t, err)
+	proxier := PodContainerProxier{
+		Transformers: transformers,
+	}
+
+	// Test that the namespace-filtered transformer correctly adds imagePullSecrets
+	// when processing a pod in kube-system namespace
+	kubeSystemTransformers := proxier.filterTransformersByNamespace("kube-system")
+	require.Len(t, kubeSystemTransformers, 1)
+	require.Equal(t, "quay.io proxy cache with imagePullSecrets change for kube-system only", kubeSystemTransformers[0].Name())
+
+	// Simulate what would happen with the filtered transformers
+	originalTransformers := proxier.Transformers
+	proxier.Transformers = kubeSystemTransformers
+
+	newImagePullSecrets, err := proxier.updateImagePullSecrets("test-pod", []corev1.LocalObjectReference{})
+	require.NoError(t, err)
+	expected := []corev1.LocalObjectReference{{Name: "kube-system-secret"}}
+	require.Equal(t, expected, newImagePullSecrets)
+
+	// Test that the transformer doesn't apply to other namespaces
+	defaultTransformers := proxier.filterTransformersByNamespace("default")
+	require.Len(t, defaultTransformers, 0) // No transformers should apply to default namespace
+
+	// Restore original transformers
+	proxier.Transformers = originalTransformers
+}

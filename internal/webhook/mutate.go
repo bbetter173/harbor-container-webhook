@@ -56,25 +56,28 @@ func (p *PodContainerProxier) Handle(ctx context.Context, req admission.Request)
 	}
 	containers, updated, err := p.updateContainers(ctx, pod.Spec.Containers, "normal")
 
-	// Restore original transformers
-	p.Transformers = originalTransformers
-
 	if err != nil {
+		p.Transformers = originalTransformers // restore original transformers on error
 		return admission.Errored(http.StatusInternalServerError, err)
 	}
 	pod.Spec.InitContainers = initContainers
 	pod.Spec.Containers = containers
 
 	if !updated && !updatedInit {
+		p.Transformers = originalTransformers // restore original transformers when no updates
 		return admission.Allowed("no updates")
 	}
 
-	// imagePullSecrets
+	// imagePullSecrets - this now uses the namespace-filtered transformers
 	imagePullSecrets, err := p.updateImagePullSecrets(p.getPodName(pod), pod.Spec.ImagePullSecrets)
 	if err != nil {
+		p.Transformers = originalTransformers // restore original transformers on error
 		return admission.Errored(http.StatusInternalServerError, err)
 	}
 	pod.Spec.ImagePullSecrets = imagePullSecrets
+
+	// Restore original transformers after all operations are complete
+	p.Transformers = originalTransformers
 
 	marshaledPod, err := json.Marshal(pod)
 	if err != nil {
