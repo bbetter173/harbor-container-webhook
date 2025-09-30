@@ -228,8 +228,26 @@ func (t *ruleTransformer) auth(ctx context.Context, imageRef string) (authn.Auth
 			return nil, err
 		}
 		for key, method := range dockerConfigJSON.Auths {
-			keyRegex := regexp.MustCompile(key)
-			if keyRegex.Find([]byte(imageRef)) != nil {
+			// Handle both hostname-only keys (e.g., "harbor.switch.tv") and full URL keys (e.g., "https://harbor.switch.tv")
+			// Extract hostname from the key if it's a full URL
+			hostname := key
+			if strings.HasPrefix(key, "http://") {
+				hostname = strings.TrimPrefix(key, "http://")
+			} else if strings.HasPrefix(key, "https://") {
+				hostname = strings.TrimPrefix(key, "https://")
+			}
+
+			// Remove any trailing path from hostname
+			if idx := strings.Index(hostname, "/"); idx != -1 {
+				hostname = hostname[:idx]
+			}
+
+			// Try to match both the original key and the extracted hostname
+			// Use QuoteMeta to escape special regex characters
+			keyRegex := regexp.MustCompile(regexp.QuoteMeta(key))
+			hostnameRegex := regexp.MustCompile(regexp.QuoteMeta(hostname))
+
+			if keyRegex.Find([]byte(imageRef)) != nil || hostnameRegex.Find([]byte(imageRef)) != nil {
 				if method.Auth != "" {
 					user, pass, err := decodeDockerConfigFieldAuth(method.Auth)
 					if err != nil {
