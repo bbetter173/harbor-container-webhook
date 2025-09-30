@@ -166,18 +166,25 @@ func (p *PodContainerProxier) InjectDecoder(d admission.Decoder) error {
 }
 
 func (p *PodContainerProxier) updateImagePullSecrets(podName string, imagePullSecrets []corev1.LocalObjectReference) (newImagePullSecrets []corev1.LocalObjectReference, err error) {
-	updated := false
+	currentSecrets := imagePullSecrets
+	anyUpdated := false
+
 	for _, transformer := range p.Transformers {
-		updated, newImagePullSecrets, err = transformer.RewriteImagePullSecrets(imagePullSecrets)
+		updated, updatedSecrets, err := transformer.RewriteImagePullSecrets(currentSecrets)
 		if err != nil {
 			return imagePullSecrets, err
 		}
-		if !updated {
-			return imagePullSecrets, nil
+		if updated {
+			logger.Info(fmt.Sprintf("rewriting the imagePullSecrets of the pod %s from %q to %q", podName, currentSecrets, updatedSecrets))
+			currentSecrets = updatedSecrets
+			anyUpdated = true
 		}
-		logger.Info(fmt.Sprintf("rewriting the imagePullSecrets of the pod %s from %q to %q", podName, imagePullSecrets, newImagePullSecrets))
 	}
-	return newImagePullSecrets, nil
+
+	if !anyUpdated {
+		return imagePullSecrets, nil
+	}
+	return currentSecrets, nil
 }
 
 func (p *PodContainerProxier) getPodName(pod *corev1.Pod) (podName string) {
