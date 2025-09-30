@@ -49,12 +49,12 @@ func (p *PodContainerProxier) Handle(ctx context.Context, req admission.Request)
 	originalTransformers := p.Transformers
 	p.Transformers = applicableTransformers
 
-	initContainers, updatedInit, initSecrets, err := p.updateContainers(ctx, pod.Spec.InitContainers, "init")
+	initContainers, updatedInit, err := p.updateContainers(ctx, pod.Spec.InitContainers, "init")
 	if err != nil {
 		p.Transformers = originalTransformers // restore original transformers
 		return admission.Errored(http.StatusInternalServerError, err)
 	}
-	containers, updated, containerSecrets, err := p.updateContainers(ctx, pod.Spec.Containers, "normal")
+	containers, updated, err := p.updateContainers(ctx, pod.Spec.Containers, "normal")
 
 	// Restore original transformers
 	p.Transformers = originalTransformers
@@ -62,16 +62,7 @@ func (p *PodContainerProxier) Handle(ctx context.Context, req admission.Request)
 	if err != nil {
 		return admission.Errored(http.StatusInternalServerError, err)
 	}
-
-	// Merge collected secrets with existing pod secrets
-	allSecrets := append(initSecrets, containerSecrets...)
-	secretsUpdated := len(allSecrets) > 0
-	if secretsUpdated {
-		pod.Spec.ImagePullSecrets = p.mergeImagePullSecrets(pod.Spec.ImagePullSecrets, allSecrets)
-		logger.Info(fmt.Sprintf("injected %d image pull secrets", len(allSecrets)))
-	}
-
-	if !updated && !updatedInit && !secretsUpdated {
+	if !updated && !updatedInit {
 		return admission.Allowed("no updates")
 	}
 	pod.Spec.InitContainers = initContainers
@@ -93,17 +84,14 @@ func (p *PodContainerProxier) lookupNodeArchAndOS(ctx context.Context, restClien
 	return node.Status.NodeInfo.Architecture, node.Status.NodeInfo.OperatingSystem, nil
 }
 
-func (p *PodContainerProxier) updateContainers(ctx context.Context, containers []corev1.Container, kind string) ([]corev1.Container, bool, []corev1.LocalObjectReference, error) {
+func (p *PodContainerProxier) updateContainers(ctx context.Context, containers []corev1.Container, kind string) ([]corev1.Container, bool, error) {
 	containersReplacement := make([]corev1.Container, 0, len(containers))
 	updated := false
-	var collectedSecrets []corev1.LocalObjectReference
-	secretsMap := make(map[string]bool) // for deduplication
-
 	for i := range containers {
 		container := containers[i]
-		imageRef, imagePullSecrets, err := p.rewriteImage(ctx, container.Image)
+		imageRef, err := p.rewriteImage(ctx, container.Image)
 		if err != nil {
-			return []corev1.Container{}, false, nil, err
+			return []corev1.Container{}, false, err
 		}
 		if !updated {
 			updated = imageRef != container.Image
@@ -113,23 +101,15 @@ func (p *PodContainerProxier) updateContainers(ctx context.Context, containers [
 		}
 		container.Image = imageRef
 		containersReplacement = append(containersReplacement, container)
-
-		// Collect image pull secrets and deduplicate
-		for _, secret := range imagePullSecrets {
-			if !secretsMap[secret.Name] {
-				collectedSecrets = append(collectedSecrets, secret)
-				secretsMap[secret.Name] = true
-			}
-		}
 	}
-	return containersReplacement, updated, collectedSecrets, nil
+	return containersReplacement, updated, nil
 }
 
-func (p *PodContainerProxier) rewriteImage(ctx context.Context, imageRef string) (string, []corev1.LocalObjectReference, error) {
+func (p *PodContainerProxier) rewriteImage(ctx context.Context, imageRef string) (string, error) {
 	for _, transformer := range p.Transformers {
 		updatedRef, err := transformer.RewriteImage(imageRef)
 		if err != nil {
-			return "", nil, fmt.Errorf("transformer %q failed to update imageRef %q: %w", transformer.Name(), imageRef, err)
+			return "", fmt.Errorf("transformer %q failed to update imageRef %q: %w", transformer.Name(), imageRef, err)
 		}
 		if updatedRef != imageRef {
 			if found, err := transformer.CheckUpstream(ctx, updatedRef); err != nil {
@@ -140,44 +120,14 @@ func (p *PodContainerProxier) rewriteImage(ctx context.Context, imageRef string)
 				continue
 			}
 			logger.Info(fmt.Sprintf("transformer %q rewriting %q to %q", transformer.Name(), imageRef, updatedRef))
-
-			// Convert transformer's ImagePullSecrets to Kubernetes LocalObjectReference
-			configSecrets := transformer.GetImagePullSecrets()
-			imagePullSecrets := make([]corev1.LocalObjectReference, len(configSecrets))
-			for i, secret := range configSecrets {
-				imagePullSecrets[i] = corev1.LocalObjectReference{Name: secret.Name}
-			}
-
-			return updatedRef, imagePullSecrets, nil
+			return updatedRef, nil
 		}
 	}
-	return imageRef, nil, nil
+	return imageRef, nil
 }
 
 // PodContainerProxier implements admission.DecoderInjector.
 // A decoder will be automatically injected.
-
-func (p *PodContainerProxier) mergeImagePullSecrets(existing []corev1.LocalObjectReference, toAdd []corev1.LocalObjectReference) []corev1.LocalObjectReference {
-	// Create a map of existing secret names for deduplication
-	existingNames := make(map[string]bool)
-	for _, secret := range existing {
-		existingNames[secret.Name] = true
-	}
-
-	// Start with existing secrets
-	result := make([]corev1.LocalObjectReference, len(existing))
-	copy(result, existing)
-
-	// Add new secrets only if they don't already exist
-	for _, secret := range toAdd {
-		if !existingNames[secret.Name] {
-			result = append(result, secret)
-			existingNames[secret.Name] = true
-		}
-	}
-
-	return result
-}
 
 // filterTransformersByNamespace returns only the transformers that should apply to the given namespace
 func (p *PodContainerProxier) filterTransformersByNamespace(namespace string) []ContainerTransformer {

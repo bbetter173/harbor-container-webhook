@@ -12,6 +12,3 @@ rules:
     namespaceExcludes: []
     replace: "harbor.example.com/dockerhub-proxy"
     checkUpstream: false
-    imagePullSecrets:
-      - name: "harbor-registry-secret"
-      - name: "backup-registry-secret"

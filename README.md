@@ -64,10 +64,6 @@ rules:
     namespaceExcludes: []
     replace: 'harbor.example.com/dockerhub-proxy'
     checkUpstream: false
-    # optional: inject image pull secrets when this rule applies
-    # NOTE: The secret must already exist in the pod namespace
-    imagePullSecrets:
-      - name: "harbor-registry-secret"
   - name: 'docker.io ubuntu rewrite rule'
     # image refs must match at least one of the rules, and not match any excludes
     matches:
