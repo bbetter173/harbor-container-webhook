@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -76,6 +77,9 @@ type ContainerTransformer interface {
 	// CheckUpstream ensures that the docker image reference exists in the upstream registry
 	// and returns if the image exists, or an error if the registry can't be contacted.
 	CheckUpstream(ctx context.Context, imageRef string) (bool, error)
+
+	// RewriteImagePullSecrets takes a list of kubernetes secret name and add the AuthSecretName parameter
+	RewriteImagePullSecrets(imagePullSecrets []corev1.LocalObjectReference) (bool, []corev1.LocalObjectReference, error)
 }
 
 func MakeTransformers(rules []config.ProxyRule, client client.Client) ([]ContainerTransformer, error) {
@@ -97,18 +101,22 @@ type ruleTransformer struct {
 
 	client client.Client
 
-	matches  []*regexp.Regexp
-	excludes []*regexp.Regexp
+	matches           []*regexp.Regexp
+	excludes          []*regexp.Regexp
+	namespaceMatches  []*regexp.Regexp
+	namespaceExcludes []*regexp.Regexp
 }
 
 var _ ContainerTransformer = (*ruleTransformer)(nil)
 
 func newRuleTransformer(rule config.ProxyRule) (*ruleTransformer, error) {
 	transformer := &ruleTransformer{
-		rule:       rule,
-		metricName: invalidMetricChars.ReplaceAllString(strings.ToLower(rule.Name), "_"),
-		matches:    make([]*regexp.Regexp, 0, len(rule.Matches)),
-		excludes:   make([]*regexp.Regexp, 0, len(rule.Excludes)),
+		rule:              rule,
+		metricName:        invalidMetricChars.ReplaceAllString(strings.ToLower(rule.Name), "_"),
+		matches:           make([]*regexp.Regexp, 0, len(rule.Matches)),
+		excludes:          make([]*regexp.Regexp, 0, len(rule.Excludes)),
+		namespaceMatches:  make([]*regexp.Regexp, 0, len(rule.NamespaceMatches)),
+		namespaceExcludes: make([]*regexp.Regexp, 0, len(rule.NamespaceExcludes)),
 	}
 	for _, matchRegex := range rule.Matches {
 		matcher, err := regexp.Compile(matchRegex)
@@ -123,6 +131,20 @@ func newRuleTransformer(rule config.ProxyRule) (*ruleTransformer, error) {
 			return nil, fmt.Errorf("failed to compile exclude regex %q: %w", excludeRegex, err)
 		}
 		transformer.excludes = append(transformer.excludes, excluder)
+	}
+	for _, namespaceMatchRegex := range rule.NamespaceMatches {
+		namespaceMatcher, err := regexp.Compile(namespaceMatchRegex)
+		if err != nil {
+			return nil, fmt.Errorf("failed to compile namespace match regex %q: %w", namespaceMatchRegex, err)
+		}
+		transformer.namespaceMatches = append(transformer.namespaceMatches, namespaceMatcher)
+	}
+	for _, namespaceExcludeRegex := range rule.NamespaceExcludes {
+		namespaceExcluder, err := regexp.Compile(namespaceExcludeRegex)
+		if err != nil {
+			return nil, fmt.Errorf("failed to compile namespace exclude regex %q: %w", namespaceExcludeRegex, err)
+		}
+		transformer.namespaceExcludes = append(transformer.namespaceExcludes, namespaceExcluder)
 	}
 
 	return transformer, nil
@@ -206,8 +228,26 @@ func (t *ruleTransformer) auth(ctx context.Context, imageRef string) (authn.Auth
 			return nil, err
 		}
 		for key, method := range dockerConfigJSON.Auths {
-			keyRegex := regexp.MustCompile(key)
-			if keyRegex.Find([]byte(imageRef)) != nil {
+			// Handle both hostname-only keys (e.g., "harbor.switch.tv") and full URL keys (e.g., "https://harbor.switch.tv")
+			// Extract hostname from the key if it's a full URL
+			hostname := key
+			if strings.HasPrefix(key, "http://") {
+				hostname = strings.TrimPrefix(key, "http://")
+			} else if strings.HasPrefix(key, "https://") {
+				hostname = strings.TrimPrefix(key, "https://")
+			}
+
+			// Remove any trailing path from hostname
+			if idx := strings.Index(hostname, "/"); idx != -1 {
+				hostname = hostname[:idx]
+			}
+
+			// Try to match both the original key and the extracted hostname
+			// Use QuoteMeta to escape special regex characters
+			keyRegex := regexp.MustCompile(regexp.QuoteMeta(key))
+			hostnameRegex := regexp.MustCompile(regexp.QuoteMeta(hostname))
+
+			if keyRegex.Find([]byte(imageRef)) != nil || hostnameRegex.Find([]byte(imageRef)) != nil {
 				if method.Auth != "" {
 					user, pass, err := decodeDockerConfigFieldAuth(method.Auth)
 					if err != nil {
@@ -271,4 +311,72 @@ func (t *ruleTransformer) anyExclusion(imageRef string) bool {
 		}
 	}
 	return false
+}
+
+// ShouldApplyToNamespace determines if this rule should be applied to the given namespace
+func (t *ruleTransformer) ShouldApplyToNamespace(namespace string) bool {
+	// If NamespaceMatches is specified, the namespace must match at least one pattern
+	if len(t.namespaceMatches) > 0 {
+		matched := false
+		for _, rule := range t.namespaceMatches {
+			if rule.MatchString(namespace) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return false
+		}
+	}
+
+	// If NamespaceExcludes is specified, the namespace must not match any exclude pattern
+	if len(t.namespaceExcludes) > 0 {
+		for _, rule := range t.namespaceExcludes {
+			if rule.MatchString(namespace) {
+				return false
+			}
+		}
+	}
+
+	return true
+}
+
+func (t *ruleTransformer) RewriteImagePullSecrets(imagePullSecrets []corev1.LocalObjectReference) (updated bool, newImagePullSecrets []corev1.LocalObjectReference, err error) {
+	if t.rule.AuthSecretName == "" && t.rule.ReplaceImagePullSecrets {
+		return false, imagePullSecrets, fmt.Errorf("replaceImagePullSecrets is enabled but no authSecretName parameter")
+	}
+	if !t.rule.ReplaceImagePullSecrets {
+		return false, imagePullSecrets, nil
+	}
+
+	start := time.Now()
+	updated, imagePullSecrets = t.doRewriteImagePullSecrets(imagePullSecrets)
+	duration := time.Since(start)
+	if updated {
+		rewrite.WithLabelValues(t.metricName).Inc()
+		rewriteTime.WithLabelValues(t.metricName).Observe(duration.Seconds())
+	} else if !updated {
+		return false, imagePullSecrets, nil
+	}
+	return true, imagePullSecrets, nil
+}
+
+func (t *ruleTransformer) doRewriteImagePullSecrets(imagePullSecrets []corev1.LocalObjectReference) (bool, []corev1.LocalObjectReference) {
+	existingSecrets := t.getExistingSecrets(imagePullSecrets)
+
+	if slices.Contains(existingSecrets, t.rule.AuthSecretName) {
+		return false, imagePullSecrets
+	}
+	newImagePullSecret := corev1.LocalObjectReference{
+		Name: t.rule.AuthSecretName,
+	}
+	imagePullSecrets = append(imagePullSecrets, newImagePullSecret)
+	return true, imagePullSecrets
+}
+
+func (t *ruleTransformer) getExistingSecrets(imagePullSecrets []corev1.LocalObjectReference) (existingSecrets []string) {
+	for _, secret := range imagePullSecrets {
+		existingSecrets = append(existingSecrets, secret.Name)
+	}
+	return existingSecrets
 }

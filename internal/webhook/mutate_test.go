@@ -4,6 +4,8 @@ import (
 	"context"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
+
 	"github.com/indeedeng-alpha/harbor-container-webhook/internal/config"
 
 	"github.com/stretchr/testify/require"
@@ -24,6 +26,11 @@ func TestPodContainerProxier_rewriteImage(t *testing.T) {
 		},
 		{
 			Name:    "docker.io proxy cache but only ubuntu",
+			Matches: []string{"^docker.io/(library/)?ubuntu"},
+			Replace: "harbor.example.com/ubuntu-proxy",
+		},
+		{
+			Name:    "docker.io proxy cache with imagePullSecret change",
 			Matches: []string{"^docker.io/(library/)?ubuntu"},
 			Replace: "harbor.example.com/ubuntu-proxy",
 		},
@@ -98,4 +105,240 @@ func TestPodContainerProxier_rewriteImage(t *testing.T) {
 			require.Equal(t, tc.expected, rewritten)
 		})
 	}
+}
+
+func TestPodContainerProxier_filterTransformersByNamespace(t *testing.T) {
+	// Create transformers with different namespace filtering rules
+	transformers, err := MakeTransformers([]config.ProxyRule{
+		{
+			Name:             "kube-system-only",
+			Matches:          []string{"^docker.io"},
+			Replace:          "harbor.example.com/kube-proxy",
+			NamespaceMatches: []string{"^kube-system$"},
+		},
+		{
+			Name:              "exclude-kube-namespaces",
+			Matches:           []string{"^quay.io"},
+			Replace:           "harbor.example.com/quay-proxy",
+			NamespaceExcludes: []string{"^kube-.*$"},
+		},
+		{
+			Name:    "no-namespace-filter",
+			Matches: []string{"^gcr.io"},
+			Replace: "harbor.example.com/gcr-proxy",
+		},
+		{
+			Name:              "complex-namespace-rules",
+			Matches:           []string{"^registry.io"},
+			Replace:           "harbor.example.com/registry-proxy",
+			NamespaceMatches:  []string{"^prod-.*$", "^staging-.*$"},
+			NamespaceExcludes: []string{"^prod-test$"},
+		},
+	}, nil)
+	require.NoError(t, err)
+	proxier := PodContainerProxier{
+		Transformers: transformers,
+	}
+
+	tests := []struct {
+		name                     string
+		namespace                string
+		expectedTransformerNames []string
+	}{
+		{
+			name:      "kube-system namespace should get kube-system-only and no-namespace-filter",
+			namespace: "kube-system",
+			expectedTransformerNames: []string{
+				"kube-system-only",
+				"no-namespace-filter",
+			},
+		},
+		{
+			name:      "kube-public namespace should get no-namespace-filter only",
+			namespace: "kube-public",
+			expectedTransformerNames: []string{
+				"no-namespace-filter",
+			},
+		},
+		{
+			name:      "default namespace should get exclude-kube-namespaces and no-namespace-filter",
+			namespace: "default",
+			expectedTransformerNames: []string{
+				"exclude-kube-namespaces",
+				"no-namespace-filter",
+			},
+		},
+		{
+			name:      "prod-main namespace should get complex-namespace-rules and others except kube-system-only",
+			namespace: "prod-main",
+			expectedTransformerNames: []string{
+				"exclude-kube-namespaces",
+				"no-namespace-filter",
+				"complex-namespace-rules",
+			},
+		},
+		{
+			name:      "prod-test namespace should get exclude-kube-namespaces and no-namespace-filter (excluded from complex)",
+			namespace: "prod-test",
+			expectedTransformerNames: []string{
+				"exclude-kube-namespaces",
+				"no-namespace-filter",
+			},
+		},
+		{
+			name:      "staging-app namespace should get complex-namespace-rules and others except kube-system-only",
+			namespace: "staging-app",
+			expectedTransformerNames: []string{
+				"exclude-kube-namespaces",
+				"no-namespace-filter",
+				"complex-namespace-rules",
+			},
+		},
+		{
+			name:      "random namespace should get exclude-kube-namespaces and no-namespace-filter only",
+			namespace: "random",
+			expectedTransformerNames: []string{
+				"exclude-kube-namespaces",
+				"no-namespace-filter",
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			filtered := proxier.filterTransformersByNamespace(tc.namespace)
+
+			// Check that we got the expected number of transformers
+			require.Len(t, filtered, len(tc.expectedTransformerNames))
+
+			// Check that we got the expected transformers by name
+			actualNames := make([]string, len(filtered))
+			for i, transformer := range filtered {
+				actualNames[i] = transformer.Name()
+			}
+
+			require.ElementsMatch(t, tc.expectedTransformerNames, actualNames)
+		})
+	}
+}
+
+func TestPodContainerProxier_updateImagePullSecretsWithReplaceEnabled(t *testing.T) {
+	transformers, err := MakeTransformers([]config.ProxyRule{
+		{
+			Name:                    "docker.io proxy cache with imagePullSecrets change",
+			Matches:                 []string{"^docker.io"},
+			Replace:                 "harbor.example.com/dockerhub-proxy",
+			ReplaceImagePullSecrets: true,
+			AuthSecretName:          "secret-test",
+		},
+	}, nil)
+	require.NoError(t, err)
+	proxier := PodContainerProxier{
+		Transformers: transformers,
+	}
+
+	type testcase struct {
+		name             string
+		imagePullSecrets []corev1.LocalObjectReference
+		expected         []corev1.LocalObjectReference
+	}
+	tests := []testcase{
+		{
+			name:             "imagePullSecrets is empty, replacement is expected and secret name should be added",
+			imagePullSecrets: []corev1.LocalObjectReference{},
+			expected:         []corev1.LocalObjectReference{{Name: "secret-test"}},
+		},
+		{
+			name:             "imagePullSecrets has a secret, replacement is expected and secret name should be added",
+			imagePullSecrets: []corev1.LocalObjectReference{{Name: "mysecret"}},
+			expected:         []corev1.LocalObjectReference{{Name: "mysecret"}, {Name: "secret-test"}},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			newImagePullSecrets, err := proxier.updateImagePullSecrets("pod-test", tc.imagePullSecrets)
+			require.NoError(t, err)
+			require.Equal(t, tc.expected, newImagePullSecrets)
+		})
+	}
+}
+
+func TestPodContainerProxier_updateImagePullSecretsWithReplaceDinabled(t *testing.T) {
+	transformers, err := MakeTransformers([]config.ProxyRule{
+		{
+			Name:    "docker.io proxy cache without imagePullSecrets change",
+			Matches: []string{"^docker.io"},
+			Replace: "harbor.example.com/dockerhub-proxy",
+		},
+	}, nil)
+	require.NoError(t, err)
+	proxier := PodContainerProxier{
+		Transformers: transformers,
+	}
+
+	type testcase struct {
+		name             string
+		imagePullSecrets []corev1.LocalObjectReference
+		expected         []corev1.LocalObjectReference
+	}
+	tests := []testcase{
+		{
+			name:             "imagePullSecrets is empty, replacement is not expected",
+			imagePullSecrets: []corev1.LocalObjectReference{},
+			expected:         []corev1.LocalObjectReference{},
+		},
+		{
+			name:             "imagePullSecrets has a secret, replacement is not expected",
+			imagePullSecrets: []corev1.LocalObjectReference{{Name: "mysecret"}},
+			expected:         []corev1.LocalObjectReference{{Name: "mysecret"}},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			newImagePullSecrets, err := proxier.updateImagePullSecrets("pod-test", tc.imagePullSecrets)
+			require.NoError(t, err)
+			require.Equal(t, tc.expected, newImagePullSecrets)
+		})
+	}
+}
+
+func TestPodContainerProxier_updateImagePullSecretsWithNamespaceFiltering(t *testing.T) {
+	// This test verifies the bug fix where transformer list was restored too early,
+	// causing namespace-filtered transformers to not update imagePullSecrets
+	transformers, err := MakeTransformers([]config.ProxyRule{
+		{
+			Name:                    "quay.io proxy cache with imagePullSecrets change for kube-system only",
+			Matches:                 []string{"^quay.io"},
+			Replace:                 "harbor.example.com/quay-proxy",
+			ReplaceImagePullSecrets: true,
+			AuthSecretName:          "kube-system-secret",
+			NamespaceMatches:        []string{"^kube-system$"}, // Only applies to kube-system
+		},
+	}, nil)
+	require.NoError(t, err)
+	proxier := PodContainerProxier{
+		Transformers: transformers,
+	}
+
+	// Test that the namespace-filtered transformer correctly adds imagePullSecrets
+	// when processing a pod in kube-system namespace
+	kubeSystemTransformers := proxier.filterTransformersByNamespace("kube-system")
+	require.Len(t, kubeSystemTransformers, 1)
+	require.Equal(t, "quay.io proxy cache with imagePullSecrets change for kube-system only", kubeSystemTransformers[0].Name())
+
+	// Simulate what would happen with the filtered transformers
+	originalTransformers := proxier.Transformers
+	proxier.Transformers = kubeSystemTransformers
+
+	newImagePullSecrets, err := proxier.updateImagePullSecrets("test-pod", []corev1.LocalObjectReference{})
+	require.NoError(t, err)
+	expected := []corev1.LocalObjectReference{{Name: "kube-system-secret"}}
+	require.Equal(t, expected, newImagePullSecrets)
+
+	// Test that the transformer doesn't apply to other namespaces
+	defaultTransformers := proxier.filterTransformersByNamespace("default")
+	require.Len(t, defaultTransformers, 0) // No transformers should apply to default namespace
+
+	// Restore original transformers
+	proxier.Transformers = originalTransformers
 }

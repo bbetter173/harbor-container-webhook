@@ -38,19 +38,46 @@ func (p *PodContainerProxier) Handle(ctx context.Context, req admission.Request)
 		return admission.Errored(http.StatusBadRequest, err)
 	}
 
+	// Filter transformers based on the pod's namespace
+	namespace := req.Namespace
+	applicableTransformers := p.filterTransformersByNamespace(namespace)
+	if len(applicableTransformers) == 0 {
+		return admission.Allowed("no applicable rules for namespace")
+	}
+
+	// Temporarily replace transformers with filtered ones for this request
+	originalTransformers := p.Transformers
+	p.Transformers = applicableTransformers
+
 	initContainers, updatedInit, err := p.updateContainers(ctx, pod.Spec.InitContainers, "init")
 	if err != nil {
+		p.Transformers = originalTransformers // restore original transformers
 		return admission.Errored(http.StatusInternalServerError, err)
 	}
 	containers, updated, err := p.updateContainers(ctx, pod.Spec.Containers, "normal")
+
 	if err != nil {
+		p.Transformers = originalTransformers // restore original transformers on error
 		return admission.Errored(http.StatusInternalServerError, err)
-	}
-	if !updated && !updatedInit {
-		return admission.Allowed("no updates")
 	}
 	pod.Spec.InitContainers = initContainers
 	pod.Spec.Containers = containers
+
+	if !updated && !updatedInit {
+		p.Transformers = originalTransformers // restore original transformers when no updates
+		return admission.Allowed("no updates")
+	}
+
+	// imagePullSecrets - this now uses the namespace-filtered transformers
+	imagePullSecrets, err := p.updateImagePullSecrets(p.getPodName(pod), pod.Spec.ImagePullSecrets)
+	if err != nil {
+		p.Transformers = originalTransformers // restore original transformers on error
+		return admission.Errored(http.StatusInternalServerError, err)
+	}
+	pod.Spec.ImagePullSecrets = imagePullSecrets
+
+	// Restore original transformers after all operations are complete
+	p.Transformers = originalTransformers
 
 	marshaledPod, err := json.Marshal(pod)
 	if err != nil {
@@ -68,7 +95,7 @@ func (p *PodContainerProxier) lookupNodeArchAndOS(ctx context.Context, restClien
 	return node.Status.NodeInfo.Architecture, node.Status.NodeInfo.OperatingSystem, nil
 }
 
-func (p *PodContainerProxier) updateContainers(ctx context.Context, containers []corev1.Container, kind string) ([]corev1.Container, bool, error) {
+func (p *PodContainerProxier) updateContainers(ctx context.Context, containers []corev1.Container, _ string) ([]corev1.Container, bool, error) {
 	containersReplacement := make([]corev1.Container, 0, len(containers))
 	updated := false
 	for i := range containers {
@@ -113,8 +140,62 @@ func (p *PodContainerProxier) rewriteImage(ctx context.Context, imageRef string)
 // PodContainerProxier implements admission.DecoderInjector.
 // A decoder will be automatically injected.
 
+// filterTransformersByNamespace returns only the transformers that should apply to the given namespace
+func (p *PodContainerProxier) filterTransformersByNamespace(namespace string) []ContainerTransformer {
+	applicableTransformers := make([]ContainerTransformer, 0)
+
+	for _, transformer := range p.Transformers {
+		// Type assert to access the ShouldApplyToNamespace method
+		if ruleTransformer, ok := transformer.(*ruleTransformer); ok {
+			if ruleTransformer.ShouldApplyToNamespace(namespace) {
+				applicableTransformers = append(applicableTransformers, transformer)
+			}
+		} else {
+			// For any other transformer types, include them (backward compatibility)
+			applicableTransformers = append(applicableTransformers, transformer)
+		}
+	}
+
+	return applicableTransformers
+}
+
 // InjectDecoder injects the decoder.
 func (p *PodContainerProxier) InjectDecoder(d admission.Decoder) error {
 	p.Decoder = d
 	return nil
+}
+
+func (p *PodContainerProxier) updateImagePullSecrets(podName string, imagePullSecrets []corev1.LocalObjectReference) (newImagePullSecrets []corev1.LocalObjectReference, err error) {
+	currentSecrets := imagePullSecrets
+	anyUpdated := false
+
+	for _, transformer := range p.Transformers {
+		updated, updatedSecrets, err := transformer.RewriteImagePullSecrets(currentSecrets)
+		if err != nil {
+			return imagePullSecrets, err
+		}
+		if updated {
+			logger.Info(fmt.Sprintf("rewriting the imagePullSecrets of the pod %s from %q to %q", podName, currentSecrets, updatedSecrets))
+			currentSecrets = updatedSecrets
+			anyUpdated = true
+		}
+	}
+
+	if !anyUpdated {
+		return imagePullSecrets, nil
+	}
+	return currentSecrets, nil
+}
+
+func (p *PodContainerProxier) getPodName(pod *corev1.Pod) (podName string) {
+	if pod.Name != "" {
+		return pod.Name
+	}
+	if pod.ObjectMeta.Labels["app.kubernetes.io/name"] != "" {
+		return pod.ObjectMeta.Labels["app.kubernetes.io/name"]
+	}
+	if pod.ObjectMeta.Labels["app"] != "" {
+		return pod.ObjectMeta.Labels["app"]
+	}
+	return pod.GenerateName
 }

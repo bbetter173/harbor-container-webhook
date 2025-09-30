@@ -3,9 +3,12 @@ certDir: "./hack/certs"
 healthAddr: ":8080"
 metricsAddr: ":8081"
 rules:
-  - name: 'docker.io rewrite rule'
+  - name: "docker.io rewrite rule"
     matches:
-      - '^docker.io'
+      - "^docker.io"
     excludes: []
-    replace: 'harbor.example.com/dockerhub-proxy'
+    namespaceMatches:
+      - "^kube-system$"
+    namespaceExcludes: []
+    replace: "harbor.example.com/dockerhub-proxy"
     checkUpstream: false
